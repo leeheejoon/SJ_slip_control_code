@@ -30,6 +30,14 @@ public:
         tactile_change_threshold <= 0 || tactile_confirm_seconds <= 0) {
       throw std::invalid_argument("촉각 판정 파라미터는 유효한 양수여야 합니다");
     }
+    index_force_min = declare_parameter("index_force_min", 100.0);
+    index_force_max = declare_parameter("index_force_max", 160.0);
+    index_force_margin = declare_parameter("index_force_margin", 10.0);
+    if (!std::isfinite(index_force_min) || !std::isfinite(index_force_max) ||
+        !std::isfinite(index_force_margin) || index_force_min >= index_force_max ||
+        index_force_margin < 0.0) {
+      throw std::invalid_argument("검지 힘 범위 설정 오류");
+    }
     slip_all_fingers = declare_parameter("slip_all_fingers", true);
     slip_step = declare_parameter("slip_step", 0.01);
     slip_max_step = declare_parameter("slip_max_step", 0.03);
@@ -75,7 +83,7 @@ public:
     }
 
     timer_ = create_wall_timer(
-      1s, [this]() { control_step(); });
+      500ms, [this]() { control_step(); });
   }
 
 private:
@@ -384,7 +392,7 @@ private:
         text += std::to_string(tactile_max[i]);
       }
     }
-    RCLCPP_INFO(get_logger(), "%s", text.c_str());
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "%s", text.c_str());
   }
 
   const std::array<std::string, 6> joint_names{
@@ -406,6 +414,16 @@ private:
 
   double force_min = 80.0;
   double force_max = 140.0;
+  double index_force_min = 100.0;
+  double index_force_max = 160.0;
+  double index_force_margin = 10.0;
+
+  // [목표 하한, 목표 상한, 바깥쪽 미세 보정 폭]
+  std::array<double, 3> initial_force_band(std::size_t joint) const
+  {
+    return joint == 2 ? std::array<double, 3>{index_force_min, index_force_max, index_force_margin} :
+      std::array<double, 3>{force_min, force_max, 20.0};
+  }
 
   std::vector<double> command_position;
   std::array<bool, 6> joint_stopped{};
@@ -493,38 +511,44 @@ private:
       return;
     }
 
-    RCLCPP_INFO(
-      get_logger(),
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
       "힘: %.3f, %.3f, %.3f, %.3f, %.3f, %.3f",
       effort[0], effort[1], effort[2],
       effort[3], effort[4], effort[5]);
 
     // 엄지1은 힘 제어에서 제외하고 고정 목표각 유지
     command_position[0] = 1.0;
-    // 개별 도달을 확정하지 않고, 같은 1초 판단 시점에 다섯 관절의 힘을 함께 확인한다.
+    // 개별 도달을 확정하지 않고, 같은 0.5초 판단 시점에 다섯 관절의 힘을 함께 확인한다.
     const bool initial_grasp_stopped = std::all_of(
       joint_stopped.begin() + 1, joint_stopped.end(), [](bool stopped) { return stopped; });
     if (!initial_grasp_stopped) {
-      const bool all_in_range = std::all_of(
-        effort.begin() + 1, effort.end(), [this](double force) {
-          return std::isfinite(force) && force >= force_min && force <= force_max;
-        });
+      bool all_in_range = true;
+      for (std::size_t i = 1; i < effort.size(); ++i) {
+        const auto band = initial_force_band(i);
+        all_in_range = all_in_range && std::isfinite(effort[i]) &&
+          effort[i] >= band[0] && effort[i] <= band[1];
+      }
       if (all_in_range) {
         for (std::size_t i = 1; i < effort.size(); ++i) {
           command_position[i] = position[i];
           joint_stopped[i] = true;
         }
         RCLCPP_INFO(get_logger(), "다섯 손가락 동시 목표 힘 도달: 전체 정지 확정");
+        // 빠른 판단은 초기 접근에만 적용한다. 정지 후에는 기존 1초 주기로 복귀.
+        timer_->cancel();
+        timer_ = create_wall_timer(1s, [this]() { control_step(); });
       } else {
         for (std::size_t i = 1; i < effort.size(); ++i) {
           if (!std::isfinite(effort[i])) { continue; }
-          if (effort[i] < force_min - 20.0) {
+          const auto band = initial_force_band(i);
+          if (effort[i] < band[0] - band[2]) {
             command_position[i] += 0.015;
-          } else if (effort[i] < force_min) {
+          } else if (effort[i] < band[0]) {
             command_position[i] += 0.001;
-          } else if (effort[i] > force_max + 20.0) {
+          } else if (effort[i] > band[1] + band[2]) {
             command_position[i] -= 0.015;
-          } else if (effort[i] > force_max) {
+          } else if (effort[i] > band[1]) {
             command_position[i] -= 0.001;
           } else {
             // 범위 안에서는 현재 각도를 유지하되, 다음 주기에 벗어나면 다시 보정.
