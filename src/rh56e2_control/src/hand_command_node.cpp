@@ -404,8 +404,8 @@ private:
   std::array<double, 6> force_zero{};
   bool force_zero_ready = false;
 
-  double force_min = 120.0;
-  double force_max = 180.0;
+  double force_min = 80.0;
+  double force_max = 140.0;
 
   std::vector<double> command_position;
   std::array<bool, 6> joint_stopped{};
@@ -518,10 +518,12 @@ private:
       } else {
         for (std::size_t i = 1; i < effort.size(); ++i) {
           if (!std::isfinite(effort[i])) { continue; }
-          if (effort[i] < 100.0) {
+          if (effort[i] < force_min - 20.0) {
             command_position[i] += 0.015;
           } else if (effort[i] < force_min) {
             command_position[i] += 0.001;
+          } else if (effort[i] > force_max + 20.0) {
+            command_position[i] -= 0.015;
           } else if (effort[i] > force_max) {
             command_position[i] -= 0.001;
           } else {
